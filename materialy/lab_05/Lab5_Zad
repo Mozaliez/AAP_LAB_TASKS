@@ -1,0 +1,137 @@
+# -*- coding: utf-8 -*-
+"""Analiza Przestępczości w Chicago z użyciem PySpark."""
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
+from pyspark.sql.window import Window
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import StringIndexer, VectorAssembler
+from pyspark.ml.classification import DecisionTreeClassifier
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
+# Inicjalizacja sesji Sparka
+spark = SparkSession.builder \
+    .appName("ChicagoCrimesAnalysis") \
+    .config("spark.sql.shuffle.partitions", "8") \
+    .getOrCreate()
+
+# --- 1. Wczytanie i Czyszczenie Danych ---
+
+# Wczytujemy plik CSV z automatycznym wykrywaniem schematu typów danych
+df_raw = spark.read.option("header", True).option("inferSchema", True).csv("chicago_crimes_sample.csv")
+
+# Czyszczenie danych: usuwanie duplikatów po ID oraz usuwanie wierszy z brakami w kluczowych polach
+df_cleaned = df_raw.dropDuplicates(["ID"]) \
+    .dropna(subset=["ID", "Date", "Primary Type", "Location Description"])
+
+# Konwersja formatu daty (zakładamy standardowy dla Chicago Crimes format MM/dd/yyyy hh:mm:ss a)
+df_cleaned = df_cleaned.withColumn("Timestamp", F.to_timestamp(F.col("Date"), "MM/dd/yyyy hh:mm:ss a")) \
+    .filter(F.col("Timestamp").isNotNull())
+
+# --- 2. UDF i Pora Dnia ---
+
+# Definiujemy logikę kategoryzacji pory dnia
+def get_time_of_day(hour):
+    if hour is None:
+        return "Unknown"
+    if 5 <= hour < 12:
+        return "Rano"
+    elif 12 <= hour < 17:
+        # Wykorzystujemy nową funkcję Pythona match-case dla czytelności (Python 3.10+)
+        return "Popołudnie"
+    elif 17 <= hour < 22:
+        return "Wieczór"
+    else:
+        return "Noc"
+
+# Rejestrujemy funkcję jako Spark UDF z jawnym określeniem zwracanego typu danych
+time_of_day_udf = F.udf(get_time_of_day, StringType())
+
+# Dodajemy kolumny wyciągające godzinę oraz przypisujące porę dnia
+df_enriched = df_cleaned.withColumn("Hour", F.hour(F.col("Timestamp"))) \
+    .withColumn("Time_of_Day", time_of_day_udf(F.col("Hour")))
+
+# --- 3. Optymalizacja i Partycjonowanie ---
+
+# Kesujemy zbiór danych, ponieważ posłuży nam do wielu różnych agregacji oraz modelu ML
+df_enriched.cache()
+df_enriched.count()  # Akcja wymuszająca materializację cache w pamięci
+
+# Symulacja dołączania małej tabeli słownikowej (np. priorytety typów przestępstw) poprzez Broadcast Join
+mapping_data = [("THEFT", "Wysoki"), ("BATTERY", "Wysoki"), ("CRIMINAL DAMAGE", "Średni"), ("NARCOTICS", "Niski")]
+df_dict = spark.createDataFrame(mapping_data, ["Primary Type", "Priority"])
+
+# Łączymy zoptymalizowanym mechanizmem Broadcast, wysyłając mały słownik do wszystkich workerów
+df_final = df_enriched.join(F.broadcast(df_dict), on="Primary Type", how="left")
+
+# Zapisujemy przetworzone dane do formatu Parquet, partycjonując fizycznie pliki na dysku według roku
+df_final.write.mode("overwrite").partitionBy("Year").parquet("chicago_crimes_processed.parquet")
+
+# --- 4. Analiza i Plany Zapytań ---
+
+print("\n--- ANALIZA STATYSTYCZNA: Top przestępstwa per lokacja i pora dnia ---")
+
+# Definiujemy ciężką agregację analityczną
+df_analysis = df_final.groupBy("Location Description", "Time_of_Day", "Primary Type") \
+    .agg(F.count("ID").alias("Crime_Count"))
+
+# Tworzymy okno, aby wybrać najczęstsze przestępstwo dla danej lokacji i pory dnia
+window_spec = Window.partitionBy("Location Description", "Time_of_Day").orderBy(F.col("Crime_Count").desc())
+
+df_top_crimes = df_analysis.withColumn("Rank", F.row_number().over(window_spec)) \
+    .filter(F.col("Rank") == 1) \
+    .drop("Rank") \
+    .orderBy(F.col("Crime_Count").desc())
+
+# Dokumentujemy plan wykonania Sparka (fizyczny i logiczny) za pomocą .explain()
+print("\n--- PLAN ZAPYTANIA SPARK (EXPLAIN) ---")
+df_top_crimes.explain(True)
+
+print("\n--- PRZYKŁADOWE WYNIKI AGREGACJI ---")
+df_top_crimes.show(10, truncate=False)
+
+# --- 5. Uczenie Maszynowe (MLlib) ---
+
+print("\n--- TRENOWANIE MODELU MLlib (Przewidywanie rodzaju przestępstwa) ---")
+
+# Filtrujemy dane pod kątem cech (features) oraz etykiety (label)
+ml_data = df_final.select("Location Description", "Time_of_Day", "Arrest", "Primary Type").dropna()
+
+# Indeksowanie zmiennych kategorycznych na wartości numeryczne
+indexer_loc = StringIndexer(inputCol="Location Description", outputCol="Loc_Index", handleInvalid="skip")
+indexer_time = StringIndexer(inputCol="Time_of_Day", outputCol="Time_Index", handleInvalid="skip")
+indexer_arrest = StringIndexer(inputCol="Arrest", outputCol="Arrest_Index", handleInvalid="skip")
+label_indexer = StringIndexer(inputCol="Primary Type", outputCol="label", handleInvalid="skip")
+
+# Łączenie cech wejściowych w jeden gęsty wektor
+assembler = VectorAssembler(
+    inputCols=["Loc_Index", "Time_Index", "Arrest_Index"],
+    outputCol="features"
+)
+
+# Inicjalizacja prostego klasyfikatora wieloklasowego (Drzewo Decyzyjne)
+dt = DecisionTreeClassifier(featuresCol="features", labelCol="label", maxBins=200)
+
+# Budujemy potok (Pipeline) łączący etapy transformacji danych i modelowania
+pipeline = Pipeline(stages=[indexer_loc, indexer_time, indexer_arrest, label_indexer, assembler, dt])
+
+# Podział danych na zbiór treningowy (80%) i testowy (20%)
+train_data, test_data = ml_data.randomSplit([0.8, 0.2], seed=42)
+
+# Trenowanie modelu
+model = pipeline.fit(train_data)
+
+# Testowanie modelu i predykcja
+predictions = model.transform(test_data)
+
+# Ewaluacja dokładności modelu (Accuracy)
+evaluator = MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction", metricName="accuracy")
+accuracy = evaluator.evaluate(predictions)
+print(f"Dokładność modelu klasyfikacji (Accuracy): {accuracy:.2%}")
+
+# Czyszczenie pamięci cache po zakończeniu pracy
+df_enriched.unpersist()
+
+# Zatrzymanie sesji Sparka
+spark.stop()
